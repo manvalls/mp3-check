@@ -8,11 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/fatih/color"
-	"github.com/shkh/lastfm-go/lastfm"
+	"github.com/michiwend/gomusicbrainz"
 
 	"github.com/dhowden/tag"
 	"github.com/tcolgate/mp3"
@@ -182,7 +181,14 @@ func normalize(name string) string {
 	return strings.Trim(strings.ToLower(name), " ")
 }
 
-func logProblems(data *artistMap, api *lastfm.Api) {
+func logProblems(data *artistMap) {
+	client, _ := gomusicbrainz.NewWS2Client(
+		"https://musicbrainz.org/ws/2",
+		"mp3-check",
+		"0.0.0",
+		"http://github.com/manvalls/mp3-check",
+	)
+
 	for _, artist := range *data {
 		artistNameLogged := false
 
@@ -197,11 +203,7 @@ func logProblems(data *artistMap, api *lastfm.Api) {
 				}
 			}
 
-			albumInfo, err := api.Album.GetInfo(lastfm.P{
-				"artist":      artist.name,
-				"album":       album.name,
-				"autocorrect": "1",
-			})
+			response, err := client.SearchRelease(`"`+album.name+`" AND artistname:"`+artist.name+`"`, 1, 0)
 
 			logAlbumProblems := func() {
 				if len(missingTracks) > 0 || len(wrongTracks) > 0 || len(unmatched) > 0 {
@@ -228,29 +230,46 @@ func logProblems(data *artistMap, api *lastfm.Api) {
 				}
 			}
 
+			if err != nil || len(response.Releases) == 0 {
+				logAlbumProblems()
+				continue
+			}
+
+			releaseID := response.Releases[0].ID
+
+			release, err := client.LookupRelease(releaseID, "recordings")
 			if err != nil {
 				logAlbumProblems()
 				continue
 			}
 
-			for _, track := range albumInfo.Tracks {
-				expectedDuration, _ := strconv.ParseFloat(track.Duration, 64)
-				dataTrack := album.tracksByName[normalize(track.Name)]
+			for _, medium := range release.Mediums {
+				for _, t := range medium.Tracks {
+					expectedDuration := float64(t.Length) / 1000
+					var dataTrack *track
 
-				if dataTrack == nil {
-					missingTracks = append(missingTracks, &missingTrack{
-						name:  track.Name,
-						album: album,
-					})
-				} else {
-					delete(unmatched, dataTrack)
-					duration := getDuration(dataTrack.path)
-					if duration < expectedDuration-0.5 || duration > expectedDuration+5 {
-						wrongTracks = append(wrongTracks, &wrongTrack{
-							expectedDuration: expectedDuration,
-							track:            dataTrack,
-							duration:         duration,
+					fmt.Println(medium.Position, t.Position)
+
+					disk := album.tracks[medium.Position]
+					if disk != nil {
+						dataTrack = disk[t.Position]
+					}
+
+					if dataTrack == nil {
+						missingTracks = append(missingTracks, &missingTrack{
+							name:  t.Recording.Title,
+							album: album,
 						})
+					} else {
+						delete(unmatched, dataTrack)
+						duration := getDuration(dataTrack.path)
+						if duration < expectedDuration-0.5 || duration > expectedDuration+5 {
+							wrongTracks = append(wrongTracks, &wrongTrack{
+								expectedDuration: expectedDuration,
+								track:            dataTrack,
+								duration:         duration,
+							})
+						}
 					}
 				}
 			}
@@ -291,22 +310,6 @@ func main() {
 	app := &cli.App{
 		Name:  "mp3-check",
 		Usage: "check your mp3 collection against last.fm",
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:    "key",
-				Aliases: []string{"k"},
-				EnvVars: []string{"LASTFM_API_KEY"},
-				Value:   "",
-				Usage:   "last.fm API key",
-			},
-			&cli.StringFlag{
-				Name:    "secret",
-				Aliases: []string{"s"},
-				EnvVars: []string{"LASTFM_API_SECRET"},
-				Value:   "",
-				Usage:   "last.fm API secret",
-			},
-		},
 		Commands: []*cli.Command{
 			{
 				Name:    "problems",
@@ -318,10 +321,8 @@ func main() {
 						folder = c.Args().Get(0)
 					}
 
-					api := lastfm.New(c.String("key"), c.String("secret"))
-
 					data := getFolderData(folder)
-					logProblems(data, api)
+					logProblems(data)
 					return nil
 				},
 			},
